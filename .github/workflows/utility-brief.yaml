@@ -9,7 +9,7 @@ jobs:
   run-brief:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # needed for auto-commit
+      contents: write
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}   # Project-scoped key
       ASSISTANT_ID: ${{ secrets.ASSISTANT_ID }}
@@ -18,19 +18,21 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Install jq and curl
+        run: sudo apt-get update && sudo apt-get install -y jq curl
 
       - name: Compute dates and ensure output dir
         id: dt
+        shell: bash
         run: |
           set -euo pipefail
-          echo "DATE_UTC=$(date -u +%F)" >> $GITHUB_OUTPUT
-          echo "DATE_TITLE=$(date -u +'%-b %-d \x27%y')" >> $GITHUB_OUTPUT
+          echo "DATE_UTC=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          echo "DATE_TITLE=$(date -u +'%-b %-d \x27%y')" >> "$GITHUB_OUTPUT"
           mkdir -p briefs
 
-      - name: Create thread (Project-scoped via API key)
+      - name: Create thread (Assistants v2)
         id: thread
+        shell: bash
         run: |
           set -euo pipefail
           RESP=$(curl -sS https://api.openai.com/v1/threads \
@@ -40,67 +42,55 @@ jobs:
             -d '{}')
           echo "THREAD_RESP: $RESP"
           THREAD_ID=$(echo "$RESP" | jq -r '.id // empty')
-          if [ -z "${THREAD_ID:-}" ] || [ "$THREAD_ID" = "null" ]; then
-            echo "Failed to create thread. Full response above."
-            exit 1
+          if [ -z "${THREAD_ID:-}" ]; then
+            echo "Failed to create thread"; exit 1
           fi
-          echo "THREAD_ID=$THREAD_ID" >> $GITHUB_OUTPUT
+          echo "THREAD_ID=$THREAD_ID" >> "$GITHUB_OUTPUT"
 
       - name: Add message to thread
+        shell: bash
         run: |
           set -euo pipefail
           USER_MSG="Run today's UtilityDive brief. Title it: ${{ steps.dt.outputs.DATE_TITLE }} Brief. If a prior Profile JSON appears in the thread, apply it first."
-          RESP=$(curl -sS https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/messages \
+          BODY=$(jq -n --arg msg "$USER_MSG" '{role:"user",content:[{type:"text",text:$msg}]}')
+          RESP=$(curl -sS "https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/messages" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -H "OpenAI-Beta: assistants=v2" \
             -H "Content-Type: application/json" \
-            -d @- <<'JSON'
-          {
-            "role": "user",
-            "content": [
-              { "type": "text", "text": "'"$USER_MSG"'" }
-            ]
-          }
-JSON
-)
-          echo "ADD_MSG_RESP: $RESP"
-          # Not strictly needed to parse here; if it failed, next step will fail.
+            -d "$BODY")
+          echo "ADD_MSG_RESP: $RESP" >/dev/null
 
       - name: Start run
         id: run
+        shell: bash
         run: |
           set -euo pipefail
-          RESP=$(curl -sS https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/runs \
+          BODY=$(jq -n --arg a "${ASSISTANT_ID}" '{assistant_id:$a, instructions:"Please execute the daily process now."}')
+          RESP=$(curl -sS "https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/runs" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -H "OpenAI-Beta: assistants=v2" \
             -H "Content-Type: application/json" \
-            -d @- <<JSON
-          {
-            "assistant_id": "${{ env.ASSISTANT_ID }}",
-            "instructions": "Please execute the daily process now."
-          }
-JSON
-)
+            -d "$BODY")
           echo "RUN_RESP: $RESP"
           RUN_ID=$(echo "$RESP" | jq -r '.id // empty')
-          if [ -z "${RUN_ID:-}" ] || [ "$RUN_ID" = "null" ]; then
-            echo "Failed to start run. Full response above."
-            exit 1
+          if [ -z "${RUN_ID:-}" ]; then
+            echo "Failed to start run"; exit 1
           fi
-          echo "RUN_ID=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "RUN_ID=$RUN_ID" >> "$GITHUB_OUTPUT"
 
       - name: Poll run until completed
+        shell: bash
         run: |
           set -euo pipefail
           for i in {1..120}; do
-            STATUS_JSON=$(curl -sS https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/runs/${{ steps.run.outputs.RUN_ID }} \
+            STATUS_JSON=$(curl -sS "https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/runs/${{ steps.run.outputs.RUN_ID }}" \
               -H "Authorization: Bearer $OPENAI_API_KEY" \
               -H "OpenAI-Beta: assistants=v2")
             STATUS=$(echo "$STATUS_JSON" | jq -r '.status // empty')
             echo "Status: $STATUS"
             if [ "$STATUS" = "completed" ]; then
               break
-            elif [ "$STATUS" = "failed" ] || [ "$STATUS" = "cancelled" ] || [ "$STATUS" = "expired" ] || [ -z "$STATUS" ]; then
+            elif [[ "$STATUS" =~ ^(failed|cancelled|expired)$ ]] || [ -z "$STATUS" ]; then
               echo "Run ended or invalid response:"
               echo "$STATUS_JSON"
               exit 1
@@ -110,12 +100,13 @@ JSON
 
       - name: Fetch assistant messages (assemble brief)
         id: messages
+        shell: bash
         run: |
           set -euo pipefail
           MSGS=$(curl -sS "https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/messages?order=asc" \
             -H "Authorization: Bearer $OPENAI_API_KEY" \
             -H "OpenAI-Beta: assistants=v2")
-          echo "MESSAGES_RESP: $(echo "$MSGS" | jq -r '.data | length') messages"
+          echo "MESSAGES_COUNT: $(echo "$MSGS" | jq -r '.data | length')"
           BODY=$(echo "$MSGS" | jq -r '
             .data[]
             | select(.role=="assistant")
@@ -125,7 +116,7 @@ JSON
           ')
           OUTFILE="briefs/${{ steps.dt.outputs.DATE_UTC }}.md"
           printf "%s\n" "$BODY" > "$OUTFILE"
-          echo "OUTFILE=$OUTFILE" >> $GITHUB_OUTPUT
+          echo "OUTFILE=$OUTFILE" >> "$GITHUB_OUTPUT"
           echo "Wrote brief to $OUTFILE"
 
       - name: Commit brief to repo
