@@ -1,0 +1,98 @@
+name: Utility Dive Daily Brief (Project-scoped, weekdays 14:00 UTC)
+
+on:
+  schedule:
+    - cron: "0 14 * * 1-5"   # Mon–Fri at 14:00 UTC
+  workflow_dispatch:         # allow manual runs
+
+jobs:
+  run-brief:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed for auto-commit
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}   # Project-scoped key
+      ASSISTANT_ID: ${{ secrets.ASSISTANT_ID }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Compute dates and ensure output dir
+        id: dt
+        run: |
+          echo "DATE_UTC=$(date -u +%F)" >> $GITHUB_OUTPUT
+          echo "DATE_TITLE=$(date -u +'%-b %-d \x27%y')" >> $GITHUB_OUTPUT
+          mkdir -p briefs
+
+      - name: Create thread (Project-scoped via API key)
+        id: thread
+        run: |
+          THREAD_JSON=$(curl -s https://api.openai.com/v1/threads \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          echo "$THREAD_JSON"
+          THREAD_ID=$(echo "$THREAD_JSON" | jq -r '.id')
+          echo "THREAD_ID=$THREAD_ID" >> $GITHUB_OUTPUT
+
+      - name: Add message to thread
+        run: |
+          USER_MSG="Run today's UtilityDive brief. Title it: ${{ steps.dt.outputs.DATE_TITLE }} Brief. If a prior Profile JSON appears in the thread, apply it first."
+          curl -s https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/messages \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @- <<JSON
+          {"role":"user","content":[{"type":"text","text":"${USER_MSG}"}]}
+
+      - name: Start run
+        id: run
+        run: |
+          RUN_JSON=$(curl -s https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/runs \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d @- <<JSON
+          { "assistant_id": "${{ env.ASSISTANT_ID }}", "instructions": "Please execute the daily process now." }
+          echo "$RUN_JSON"
+          RUN_ID=$(echo "$RUN_JSON" | jq -r '.id')
+          echo "RUN_ID=$RUN_ID" >> $GITHUB_OUTPUT
+
+      - name: Poll run until completed
+        run: |
+          for i in {1..120}; do
+            STATUS_JSON=$(curl -s https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/runs/${{ steps.run.outputs.RUN_ID }} \
+              -H "Authorization: Bearer $OPENAI_API_KEY")
+            STATUS=$(echo "$STATUS_JSON" | jq -r '.status')
+            echo "Status: $STATUS"
+            if [ "$STATUS" = "completed" ]; then break; fi
+            if [[ "$STATUS" =~ ^(failed|cancelled|expired)$ ]]; then
+              echo "Run ended: $STATUS"; echo "$STATUS_JSON"; exit 1
+            fi
+            sleep 10
+          done
+
+      - name: Fetch assistant messages (assemble brief)
+        id: messages
+        run: |
+          MSGS=$(curl -s "https://api.openai.com/v1/threads/${{ steps.thread.outputs.THREAD_ID }}/messages?order=asc" \
+            -H "Authorization: Bearer $OPENAI_API_KEY")
+          BODY=$(echo "$MSGS" | jq -r '
+            .data[]
+            | select(.role=="assistant")
+            | .content[]
+            | select(.type=="text")
+            | .text.value
+          ')
+          OUTFILE="briefs/${{ steps.dt.outputs.DATE_UTC }}.md"
+          printf "%s\n" "$BODY" > "$OUTFILE"
+          echo "OUTFILE=$OUTFILE" >> $GITHUB_OUTPUT
+          echo "Wrote brief to $OUTFILE"
+
+      - name: Commit brief to repo
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Add daily UtilityDive brief: ${{ steps.dt.outputs.DATE_UTC }}"
+          file_pattern: "briefs/*.md"
